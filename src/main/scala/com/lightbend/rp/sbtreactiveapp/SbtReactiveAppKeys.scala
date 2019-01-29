@@ -126,9 +126,22 @@ trait SbtReactiveAppKeys {
   val applications = TaskKey[Seq[(String, Seq[String])]]("rp-applications")
 
   /**
-   * This task deploys all aggregated projects into a target environment. Currently, minikube is supported.
+   * This task deploys all aggregated projects into a target environment. Currently, minikube is supported, but
+    * additional targets may be defined using the deployTargets key. eg. `deployTargets ++= Map("myEnv" -> myTask)`
    */
   val deploy = InputKey[Unit]("deploy")
+
+  //  type DeploymentFactory = TaskKey[Unit]
+
+  type DeploymentFactory = Def.Initialize[Task[Unit]]
+
+  /**
+   * A map of deployment targets to deployment factory to execute.
+   *
+   * Default targets are minikube but end users can now add additional targets with their own deployment process to the
+   * map so that the potential for multiple environments or configurations is supported.
+   */
+  val deployTargets = SettingKey[Map[String, DeploymentFactory]]("rp-deploy-targets")
 
   /**
    * A map of service names to service lookup addresses. This will be provided as an argument to rp for resources

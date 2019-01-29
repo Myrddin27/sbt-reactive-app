@@ -45,177 +45,201 @@ trait DeployableApp extends App {
     deployMinikubePlayHostAllowedProperty := "play.filters.hosts.allowed.0",
     deployMinikubePlayHttpSecretKeyProperty := "play.http.secret.key",
     deployMinikubePlayHttpSecretKeyValue := "dev-minikube",
-    deploy := {
-      import complete.DefaultParsers._
+    deployTargets := Map[String, DeploymentFactory]("minikube" -> deployMinikube),
+    deploy := deployTask.evaluated,
+    deployMinikubeRpArguments := Seq.empty)
 
-      val args = spaceDelimited("<arg>").parsed
-      val isPlagom = Set("play", "lagom").contains(appType.value)
-      val bootstrapEnabled = enableAkkaClusterBootstrap.value
-      val reactiveSandbox = deployMinikubeEnableReactiveSandbox.value
+  import complete.DefaultParsers._
+  import complete.Parser
 
-      args.headOption.getOrElse("").trim.toLowerCase match {
-        case "minikube" => {
-          // @TODO Windows support is partially implemented. When finishing impl, remove this guard.
-          // Issue that remains is that when arguments for rp have spaces, nodejs blows up
+  val deployTaskParser = Def.setting {
+    import Parser.token
+    val targets = deployTargets.value
+    (token(Space) ~> token(targets.keys.map(key => {
+      val parser: Parser[String] = key
+      parser
+    }).reduce(_ | _))).* <~ token(Space).*
+  }
 
-          if (isWindows) {
-            sys.error("deploy is not currently supported on Microsoft Windows")
-          }
+  def deployTask: Def.Initialize[InputTask[Unit]] = Def.inputTaskDyn[Unit] {
+    val log = streams.value.log
+    val targets = deployTargets.value
+    //    val args = spaceDelimited("<arg>").parsed
+    val args = deployTaskParser.parsed
+    val targetKey = args.headOption.getOrElse("").trim.toLowerCase
+    targets.find {
+      case (key, _) => targetKey.equalsIgnoreCase(key)
+    } match {
+      case Some((targetAlias: String, deploymentFactory: DeploymentFactory)) => {
+        log.info(s"""Attempting deployment for target "$targetAlias".""")
+        deploymentFactory
+      }
+      case None => {
+        sys.error(s"""Unknown deployment target: "$targetKey". Available: ${targets.keys.toSeq.sorted.mkString(", ")}""")
+      }
+    }
+  }
 
-          val minikubeExec =
-            if (isWindows)
-              target.value / "minikube-exec.ps1"
-            else
-              target.value / "minikube-exec"
+  def deployMinikube: Def.Initialize[Task[Unit]] = Def.task {
+    val isPlagom = Set("play", "lagom").contains(appType.value)
+    val bootstrapEnabled = enableAkkaClusterBootstrap.value
+    val reactiveSandbox = deployMinikubeEnableReactiveSandbox.value
 
-          val log = streams.value.log
-          val waitTimeMs = 1000 * 60 * 5
+    // @TODO Windows support is partially implemented. When finishing impl, remove this guard.
+    // Issue that remains is that when arguments for rp have spaces, nodejs blows up
 
-          cmd.minikube.assert()
-          cmd.kubectl.assert()
-          cmd.rp.assert()
+    if (isWindows) {
+      sys.error("deploy is not currently supported on Microsoft Windows")
+    }
 
-          if (reactiveSandbox) {
-            cmd.helm.assert();
-          }
+    val minikubeExec =
+      if (isWindows)
+        target.value / "minikube-exec.ps1"
+      else
+        target.value / "minikube-exec"
 
-          // This wrapper script that sets minikube environment before execing its args
-          // While it would be nice to do this all via the JVM, we need this mostly for hooking into
-          // the sbt-native-packager building.
+    val log = streams.value.log
+    val waitTimeMs = 1000 * 60 * 5
 
-          IO.write(
-            minikubeExec,
+    cmd.minikube.assert()
+    cmd.kubectl.assert()
+    cmd.rp.assert()
 
-            if (isWindows)
-              """|minikube docker-env | Invoke-Expression
-                 |
-                 |$cmd, $as = $args
-                 |
-                 |& $cmd $as
-                 |""".stripMargin
-            else
-              """|#!/usr/bin/env bash
-                 |
-                 |set -e
-                 |
-                 |eval $(minikube docker-env --shell bash)
-                 |
-                 |exec "$@"
-                 |""".stripMargin)
+    if (reactiveSandbox) {
+      cmd.helm.assert();
+    }
 
-          assert(minikubeExec.setExecutable(true), s"Failed to mark $minikubeExec as executable")
+    // This wrapper script that sets minikube environment before execing its args
+    // While it would be nice to do this all via the JVM, we need this mostly for hooking into
+    // the sbt-native-packager building.
 
-          // We install the sandbox now (in on task via AtomicBoolean) but don't wait until after the build is
-          // done for it to be deployed. This saves a bit of time for the user.
+    IO.write(
+      minikubeExec,
 
-          val shouldInstallReactiveSandbox = reactiveSandbox && installReactiveSandbox.compareAndSet(false, true)
+      if (isWindows)
+        """|minikube docker-env | Invoke-Expression
+           |
+           |$cmd, $as = $args
+           |
+           |& $cmd $as
+           |""".stripMargin
+      else
+        """|#!/usr/bin/env bash
+           |
+           |set -e
+           |
+           |eval $(minikube docker-env --shell bash)
+           |
+           |exec "$@"
+           |""".stripMargin)
 
-          if (shouldInstallReactiveSandbox) {
-            if (!cmd.kubectl.deploymentExists("kube-system", "tiller-deploy")) {
-              cmd.kubectl.setupHelmRBAC(log, "kube-system")
-              cmd.helm.init(log, "tiller")
+    assert(minikubeExec.setExecutable(true), s"Failed to mark $minikubeExec as executable")
 
-              cmd.kubectl.waitForDeployment(log, "kube-system", "tiller-deploy", waitTimeMs = waitTimeMs)
-            }
+    // We install the sandbox now (in on task via AtomicBoolean) but don't wait until after the build is
+    // done for it to be deployed. This saves a bit of time for the user.
 
-            if (!cmd.kubectl.deploymentExists("default", "reactive-sandbox")) {
-              cmd.helm.installReactiveSandbox(log)
-            }
-          }
+    val shouldInstallReactiveSandbox = reactiveSandbox && installReactiveSandbox.compareAndSet(false, true)
 
-          // Setup RBAC role and a role binding
-          val rbacSetup =
-            """|kind: Role
-               |apiVersion: rbac.authorization.k8s.io/v1
-               |metadata:
-               |  name: pod-reader
-               |rules:
-               |- apiGroups: [""] # "" indicates the core API group
-               |  resources: ["pods"]
-               |  verbs: ["get", "watch", "list"]
-               |---
-               |kind: RoleBinding
-               |apiVersion: rbac.authorization.k8s.io/v1
-               |metadata:
-               |  name: read-pods
-               |subjects:
-               |- kind: User
-               |  name: system:serviceaccount:default:default
-               |roleRef:
-               |  kind: Role
-               |  name: pod-reader
-               |  apiGroup: rbac.authorization.k8s.io
-            """.stripMargin
-          cmd.kubectl.deleteAndApply(log, rbacSetup)
+    if (shouldInstallReactiveSandbox) {
+      if (!cmd.kubectl.deploymentExists("kube-system", "tiller-deploy")) {
+        cmd.kubectl.setupHelmRBAC(log, "kube-system")
+        cmd.helm.init(log, "tiller")
 
-          val minikubeIp = cmd.minikube.ip()
+        cmd.kubectl.waitForDeployment(log, "kube-system", "tiller-deploy", waitTimeMs = waitTimeMs)
+      }
 
-          val javaOpts =
-            Vector(
-              if (isPlagom) s"-D${deployMinikubePlayHostAllowedProperty.value}=$minikubeIp" else "",
-              if (isPlagom) s"-D${deployMinikubePlayHttpSecretKeyProperty.value}=${deployMinikubePlayHttpSecretKeyValue.value}" else "")
-              .filterNot(_.isEmpty)
+      if (!cmd.kubectl.deploymentExists("default", "reactive-sandbox")) {
+        cmd.helm.installReactiveSandbox(log)
+      }
+    }
 
-          val services =
-            if (reactiveSandbox)
-              deployMinikubeReactiveSandboxExternalServices.value ++ deployMinikubeAdditionalExternalServices.value
-            else
-              deployMinikubeAdditionalExternalServices.value
+    // Setup RBAC role and a role binding
+    val rbacSetup =
+      """|kind: Role
+         |apiVersion: rbac.authorization.k8s.io/v1
+         |metadata:
+         |  name: pod-reader
+         |rules:
+         |- apiGroups: [""] # "" indicates the core API group
+         |  resources: ["pods"]
+         |  verbs: ["get", "watch", "list"]
+         |---
+         |kind: RoleBinding
+         |apiVersion: rbac.authorization.k8s.io/v1
+         |metadata:
+         |  name: read-pods
+         |subjects:
+         |- kind: User
+         |  name: system:serviceaccount:default:default
+         |roleRef:
+         |  kind: Role
+         |  name: pod-reader
+         |  apiGroup: rbac.authorization.k8s.io
+      """.stripMargin
+    cmd.kubectl.deleteAndApply(log, rbacSetup)
 
-          val serviceArgs =
-            services.flatMap {
-              case (serviceName, serviceAddress) =>
-                Vector("--external-service", s"$serviceName=$serviceAddress")
-            }
+    val minikubeIp = cmd.minikube.ip()
 
-          val rpArgs =
-            Vector(
-              NativePackagerCompat.versioned(dockerAlias.value),
-              "--env",
-              s"JAVA_OPTS=${javaOpts.mkString(" ")}") ++
-              (if (bootstrapEnabled) Vector("--akka-cluster-skip-validation", "--pod-controller-replicas", deployMinikubeAkkaClusterBootstrapContactPoints.value.toString) else Vector.empty) ++
-              serviceArgs ++
-              deployMinikubeRpArguments.value
+    val javaOpts =
+      Vector(
+        if (isPlagom) s"-D${deployMinikubePlayHostAllowedProperty.value}=$minikubeIp" else "",
+        if (isPlagom) s"-D${deployMinikubePlayHttpSecretKeyProperty.value}=${deployMinikubePlayHttpSecretKeyValue.value}" else "")
+        .filterNot(_.isEmpty)
 
-          publishLocalDocker(
-            (stage in Docker).value,
-            if (isWindows)
-              "powershell.exe" +: minikubeExec.getAbsolutePath +: dockerBuildCommand.value
-            else
-              minikubeExec.getAbsolutePath +: dockerBuildCommand.value,
-            log)
+    val services =
+      if (reactiveSandbox)
+        deployMinikubeReactiveSandboxExternalServices.value ++ deployMinikubeAdditionalExternalServices.value
+      else
+        deployMinikubeAdditionalExternalServices.value
 
-          log.info(s"Built image ${NativePackagerCompat.versioned(dockerAlias.value)}")
+    val serviceArgs =
+      services.flatMap {
+        case (serviceName, serviceAddress) =>
+          Vector("--external-service", s"$serviceName=$serviceAddress")
+      }
 
-          if (reactiveSandbox) {
-            // FIXME: Make tiller & reactive-sandbox names configurable
+    val rpArgs =
+      Vector(
+        NativePackagerCompat.versioned(dockerAlias.value),
+        "--env",
+        s"JAVA_OPTS=${javaOpts.mkString(" ")}") ++
+        (if (bootstrapEnabled) Vector("--akka-cluster-skip-validation", "--pod-controller-replicas", deployMinikubeAkkaClusterBootstrapContactPoints.value.toString) else Vector.empty) ++
+        serviceArgs ++
+        deployMinikubeRpArguments.value
 
-            cmd.kubectl.waitForDeployment(log, "default", "reactive-sandbox", waitTimeMs = waitTimeMs)
+    publishLocalDocker(
+      (stage in Docker).value,
+      if (isWindows)
+        "powershell.exe" +: minikubeExec.getAbsolutePath +: dockerBuildCommand.value
+      else
+        minikubeExec.getAbsolutePath +: dockerBuildCommand.value,
+      log)
 
-            if (shouldInstallReactiveSandbox) {
-              for {
-                pod <- cmd.kubectl.getPodNames("app=reactive-sandbox")
-                statement <- (deployMinikubeReactiveSandboxCqlStatements in ThisBuild).value
-              } {
-                log.info(s"executing cassandra cql: $statement")
+    log.info(s"Built image ${NativePackagerCompat.versioned(dockerAlias.value)}")
 
-                cmd.kubectl.invoke(log, Seq("exec", pod, "--", "/bin/bash", "-c", s"""/opt/cassandra/bin/cqlsh "$$POD_IP" -e "$statement""""))
-              }
+    if (reactiveSandbox) {
+      // FIXME: Make tiller & reactive-sandbox names configurable
 
-              reactiveSandboxInstalledLatch.countDown()
-            } else {
-              reactiveSandboxInstalledLatch.await()
-            }
-          }
+      cmd.kubectl.waitForDeployment(log, "default", "reactive-sandbox", waitTimeMs = waitTimeMs)
 
-          val kubernetesResourcesYaml = cmd.rp.generateKubernetesResources(minikubeExec.getAbsolutePath, log, rpArgs)
+      if (shouldInstallReactiveSandbox) {
+        for {
+          pod <- cmd.kubectl.getPodNames("app=reactive-sandbox")
+          statement <- (deployMinikubeReactiveSandboxCqlStatements in ThisBuild).value
+        } {
+          log.info(s"executing cassandra cql: $statement")
 
-          cmd.kubectl.deleteAndApply(log, kubernetesResourcesYaml)
+          cmd.kubectl.invoke(log, Seq("exec", pod, "--", "/bin/bash", "-c", s"""/opt/cassandra/bin/cqlsh "$$POD_IP" -e "$statement""""))
         }
 
-        case other =>
-          sys.error(s"""Unknown deployment target: "$other". Available: minikube""")
+        reactiveSandboxInstalledLatch.countDown()
+      } else {
+        reactiveSandboxInstalledLatch.await()
       }
-    },
-    deployMinikubeRpArguments := Seq.empty)
+    }
+
+    val kubernetesResourcesYaml = cmd.rp.generateKubernetesResources(minikubeExec.getAbsolutePath, log, rpArgs)
+
+    cmd.kubectl.deleteAndApply(log, kubernetesResourcesYaml)
+  }
 }
